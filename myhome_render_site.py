@@ -38,7 +38,6 @@ def env_int(name: str, default: int) -> int:
 
 DATA_DIR = Path(os.environ.get("MYHOME_DATA_DIR") or (ROOT_DIR / "render_data"))
 DB_PATH = DATA_DIR / "myhome_render.sqlite3"
-CATALOG_CACHE_PATH = DATA_DIR / "myhome_location_catalog.json"
 ANALYTICS_DIR = DATA_DIR / "analytics"
 DEFAULT_HOST = os.environ.get("MYHOME_HOST", "0.0.0.0")
 DEFAULT_PORT = env_int("PORT", env_int("MYHOME_PORT", 10000))
@@ -47,8 +46,8 @@ DEFAULT_PER_PAGE = env_int("MYHOME_PER_PAGE", 100)
 DEFAULT_MAX_PAGES = env_int("MYHOME_MAX_PAGES", 30)
 MAX_RETURN_ITEMS = env_int("MYHOME_MAX_RETURN_ITEMS", 120)
 PROPERTY_MODES = {
-    "residential": {"label": "Квартиры", "real_estate_types": "1"},
-    "commercial": {"label": "Коммерческая", "real_estate_types": "5"},
+    "residential": {"label": "Квартиры", "real_estate_types": "1", "statuses": "2"},
+    "commercial": {"label": "Коммерческая", "real_estate_types": "5", "statuses": ""},
 }
 
 DB_SCHEMA = """
@@ -1206,6 +1205,10 @@ def resolve_property_mode(value: Any) -> str:
     return mode
 
 
+def catalog_cache_path(property_mode: str) -> Path:
+    return DATA_DIR / f"myhome_location_catalog_{resolve_property_mode(property_mode)}.json"
+
+
 def build_scope_label(payload: dict[str, Any], street_ids: list[int]) -> str:
     district_name = str(payload.get("district_name") or "").strip()
     urban_name = str(payload.get("urban_name") or "").strip()
@@ -1242,12 +1245,13 @@ def normalize_payload(payload: dict[str, Any]) -> dict[str, Any]:
     urban_id = to_int(payload.get("urban_id"))
     street_ids = int_list(payload.get("street_ids"))
     property_mode = resolve_property_mode(payload.get("property_mode"))
+    mode_config = PROPERTY_MODES[property_mode]
 
     filters = {
         "city_id": DEFAULT_CITY_ID,
         "deal_types": "1,2",
-        "real_estate_types": PROPERTY_MODES[property_mode]["real_estate_types"],
-        "statuses": "2",
+        "real_estate_types": mode_config["real_estate_types"],
+        "statuses": mode_config["statuses"],
         "property_mode": property_mode,
         "district_id": district_id,
         "urban_id": urban_id,
@@ -1258,7 +1262,7 @@ def normalize_payload(payload: dict[str, Any]) -> dict[str, Any]:
         "scope_key": hashlib.sha1(signature.encode("utf-8")).hexdigest()[:16],
         "scope_label": build_scope_label(payload, street_ids),
         "property_mode": property_mode,
-        "property_label": PROPERTY_MODES[property_mode]["label"],
+        "property_label": mode_config["label"],
         "district_id": district_id,
         "district_name": str(payload.get("district_name") or "").strip() or None,
         "urban_id": urban_id,
@@ -1271,13 +1275,14 @@ def normalize_payload(payload: dict[str, Any]) -> dict[str, Any]:
 
 def build_catalog_args(property_mode: str = "residential", refresh: bool = False) -> argparse.Namespace:
     resolved_mode = resolve_property_mode(property_mode)
+    mode_config = PROPERTY_MODES[resolved_mode]
     return argparse.Namespace(
         city_id=DEFAULT_CITY_ID,
         deal_types="1,2",
-        real_estate_types=PROPERTY_MODES[resolved_mode]["real_estate_types"],
-        statuses="2",
+        real_estate_types=mode_config["real_estate_types"],
+        statuses=mode_config["statuses"],
         currency_id="1",
-        catalog_cache=CATALOG_CACHE_PATH,
+        catalog_cache=catalog_cache_path(resolved_mode),
         refresh_catalog=refresh,
     )
 
@@ -1500,10 +1505,14 @@ def fetch_scope_rows(scope: dict[str, Any], job_id: str) -> tuple[list[dict[str,
         city_id=DEFAULT_CITY_ID,
         deal_types="1,2",
         real_estate_types=scope["filters"]["real_estate_types"],
-        statuses="2",
+        statuses=scope["filters"]["statuses"],
         currency_id="1",
     )
-    filters = export_mod.build_base_filters(args)
+    filters = {
+        key: value
+        for key, value in export_mod.build_base_filters(args).items()
+        if value not in (None, "")
+    }
     if scope["district_id"]:
         filters["districts"] = str(scope["district_id"])
     if scope["urban_id"]:
