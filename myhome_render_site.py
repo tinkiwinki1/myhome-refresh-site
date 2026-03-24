@@ -5,6 +5,7 @@ import argparse
 import datetime as dt
 import hashlib
 import json
+import math
 import os
 import sqlite3
 import threading
@@ -19,6 +20,7 @@ from urllib.parse import parse_qs, urlparse
 
 import requests
 
+import build_street_analytics_site as street_site
 import export_myhome_active as export_mod
 
 ROOT_DIR = Path(__file__).resolve().parent
@@ -37,6 +39,7 @@ def env_int(name: str, default: int) -> int:
 DATA_DIR = Path(os.environ.get("MYHOME_DATA_DIR") or (ROOT_DIR / "render_data"))
 DB_PATH = DATA_DIR / "myhome_render.sqlite3"
 CATALOG_CACHE_PATH = DATA_DIR / "myhome_location_catalog.json"
+ANALYTICS_DIR = DATA_DIR / "analytics"
 DEFAULT_HOST = os.environ.get("MYHOME_HOST", "0.0.0.0")
 DEFAULT_PORT = env_int("PORT", env_int("MYHOME_PORT", 10000))
 DEFAULT_CITY_ID = env_int("MYHOME_CITY_ID", 1)
@@ -438,6 +441,16 @@ HTML_PAGE = """<!DOCTYPE html>
       display: grid;
       gap: 8px;
     }
+    .summary-links {
+      display: flex;
+      flex-wrap: wrap;
+      gap: 10px;
+    }
+    .summary-links a {
+      text-decoration: none;
+      color: var(--accent-2);
+      font-weight: 800;
+    }
     .status-ok { color: #daf4e8; }
     .status-warn { color: #ffd9c8; }
     .muted { color: var(--muted); }
@@ -575,6 +588,19 @@ HTML_PAGE = """<!DOCTYPE html>
 
     function formatCount(value) {
       return Number(value || 0).toLocaleString("ru-RU");
+    }
+
+    function fmtMoney(value) {
+      if (value == null || Number.isNaN(Number(value))) return "n/a";
+      return `$${Number(value).toLocaleString("en-US", { maximumFractionDigits: 0 })}`;
+    }
+
+    function fmtNumber(value, digits = 1) {
+      if (value == null || Number.isNaN(Number(value))) return "n/a";
+      return Number(value).toLocaleString("ru-RU", {
+        minimumFractionDigits: digits,
+        maximumFractionDigits: digits,
+      });
     }
 
     function priceLabel(item) {
@@ -741,6 +767,22 @@ HTML_PAGE = """<!DOCTYPE html>
       if (!summary.new_count) {
         noteBits.push("Новых объявлений с прошлого обновления не найдено.");
       }
+      const analytics = summary.analytics || {};
+      const analyticsCards = analytics.total_rows != null ? `
+        <div class="summary-grid">
+          <div class="summary-stat"><small>Всего в срезе</small><strong>${esc(analytics.total_rows)}</strong></div>
+          <div class="summary-stat"><small>Sale</small><strong>${esc(analytics.sale_count ?? 0)}</strong></div>
+          <div class="summary-stat"><small>Rent</small><strong>${esc(analytics.rent_count ?? 0)}</strong></div>
+          <div class="summary-stat"><small>Median USD</small><strong>${esc(fmtMoney(analytics.median_price_usd))}</strong></div>
+          <div class="summary-stat"><small>Median USD/m²</small><strong>${esc(fmtNumber(analytics.median_price_usd_sqm))}</strong></div>
+          <div class="summary-stat"><small>Weighted USD/m²</small><strong>${esc(fmtNumber(analytics.weighted_price_usd_sqm))}</strong></div>
+          <div class="summary-stat"><small>Median area</small><strong>${esc(fmtNumber(analytics.median_area_sqm))} м²</strong></div>
+          <div class="summary-stat"><small>Период данных</small><strong>${esc(analytics.min_date || "n/a")} .. ${esc(analytics.max_date || "n/a")}</strong></div>
+        </div>
+      ` : "";
+      const summaryLinks = [];
+      if (summary.analytics_html_url) summaryLinks.push(`<a href="${esc(summary.analytics_html_url)}" target="_blank">Открыть полную аналитику</a>`);
+      if (summary.analytics_csv_url) summaryLinks.push(`<a href="${esc(summary.analytics_csv_url)}" target="_blank">Скачать CSV среза</a>`);
       $("latestSummary").innerHTML = `
         <div class="summary-card">
           <div>
@@ -754,6 +796,8 @@ HTML_PAGE = """<!DOCTYPE html>
             <div class="summary-stat"><small>Было в seen</small><strong>${esc(summary.seen_before)}</strong></div>
             <div class="summary-stat"><small>Стало в seen</small><strong>${esc(summary.seen_after)}</strong></div>
           </div>
+          ${analyticsCards}
+          ${summaryLinks.length ? `<div class="summary-links">${summaryLinks.join("")}</div>` : ""}
           <small>${esc(noteBits.join(" "))}</small>
         </div>
       `;
@@ -1044,8 +1088,36 @@ def format_local(iso_value: str | None) -> str | None:
     return parsed.astimezone().strftime("%Y-%m-%d %H:%M:%S")
 
 
+def median(values: list[float]) -> float | None:
+    filtered = sorted(value for value in values if value is not None and not math.isnan(value))
+    if not filtered:
+        return None
+    mid = len(filtered) // 2
+    if len(filtered) % 2:
+        return filtered[mid]
+    return (filtered[mid - 1] + filtered[mid]) / 2
+
+
+def weighted_sqm(rows: list[dict[str, Any]]) -> float | None:
+    weighted_sum = 0.0
+    area_sum = 0.0
+    for row in rows:
+        area = row.get("area")
+        total = row.get("price_usd_total")
+        if area is None or total is None:
+            continue
+        if area <= 0:
+            continue
+        weighted_sum += float(total)
+        area_sum += float(area)
+    if area_sum <= 0:
+        return None
+    return weighted_sum / area_sum
+
+
 def init_storage() -> None:
     DATA_DIR.mkdir(parents=True, exist_ok=True)
+    ANALYTICS_DIR.mkdir(parents=True, exist_ok=True)
     with sqlite3.connect(DB_PATH) as conn:
         conn.executescript(DB_SCHEMA)
         conn.commit()
@@ -1200,6 +1272,41 @@ def remember_listing(conn: sqlite3.Connection, scope_key: str, row: dict[str, An
         ),
     )
     return cursor.rowcount == 1
+
+
+def artifact_url_for_path(path: Path | None) -> str | None:
+    if path is None:
+        return None
+    try:
+        resolved = path.resolve()
+        resolved.relative_to(ANALYTICS_DIR.resolve())
+    except (OSError, ValueError):
+        return None
+    return f"/artifacts/{resolved.name}"
+
+
+def build_scope_artifacts(scope: dict[str, Any], rows: list[dict[str, Any]], finished_at: str) -> tuple[dict[str, Any], str | None, str | None]:
+    stamp = finished_at.replace("-", "").replace(":", "").replace("T", "_").replace("Z", "")
+    stem = f"{scope['scope_key']}_{stamp}"
+    csv_path = ANALYTICS_DIR / f"{stem}.csv"
+    html_path = ANALYTICS_DIR / f"{stem}.html"
+
+    export_mod.write_csv(csv_path, rows)
+    analytics_rows, analytics_meta = street_site.load_rows(csv_path)
+    html_path.write_text(street_site.build_html(analytics_rows, analytics_meta, csv_path), encoding="utf-8")
+
+    analytics = {
+        "total_rows": len(analytics_rows),
+        "sale_count": sum(1 for row in analytics_rows if row.get("deal_type") == "sale"),
+        "rent_count": sum(1 for row in analytics_rows if row.get("deal_type") == "rent"),
+        "median_price_usd": median([float(row["price_usd_total"]) for row in analytics_rows if row.get("price_usd_total") is not None]),
+        "median_price_usd_sqm": median([float(row["price_usd_sqm"]) for row in analytics_rows if row.get("price_usd_sqm") is not None]),
+        "weighted_price_usd_sqm": weighted_sqm(analytics_rows),
+        "median_area_sqm": median([float(row["area"]) for row in analytics_rows if row.get("area") is not None]),
+        "min_date": analytics_meta.get("min_date"),
+        "max_date": analytics_meta.get("max_date"),
+    }
+    return analytics, artifact_url_for_path(html_path), artifact_url_for_path(csv_path)
 
 
 def history_items(limit: int = 12) -> list[dict[str, Any]]:
@@ -1357,7 +1464,7 @@ def fetch_scope_rows(scope: dict[str, Any], job_id: str) -> tuple[list[dict[str,
         for page in range(1, DEFAULT_MAX_PAGES + 1):
             JOB_STORE.update(
                 job_id,
-        message=f"Сканирую страницу {page} для {scope['scope_label']}",
+                message=f"Сканирую страницу {page} для {scope['scope_label']}",
                 progress={
                     "phase": "fetching",
                     "pages_scanned": page - 1,
@@ -1432,6 +1539,7 @@ def refresh_scope(job_id: str, payload: dict[str, Any]) -> dict[str, Any]:
         message = "Новых объявлений с прошлого обновления нет."
 
     finished_at = iso_utc()
+    analytics, analytics_html_url, analytics_csv_url = build_scope_artifacts(scope, rows, finished_at)
     summary = {
         "scope_key": scope["scope_key"],
         "scope_label": scope["scope_label"],
@@ -1448,6 +1556,9 @@ def refresh_scope(job_id: str, payload: dict[str, Any]) -> dict[str, Any]:
         "seen_before": seen_before,
         "seen_after": seen_after,
         "message": message,
+        "analytics": analytics,
+        "analytics_html_url": analytics_html_url,
+        "analytics_csv_url": analytics_csv_url,
         "items": display_rows,
     }
 
@@ -1556,6 +1667,19 @@ class AppHandler(BaseHTTPRequestHandler):
                 return
             self.respond_json(payload)
             return
+        if parsed.path.startswith("/artifacts/"):
+            name = Path(parsed.path).name
+            path = ANALYTICS_DIR / name
+            try:
+                path.resolve().relative_to(ANALYTICS_DIR.resolve())
+            except ValueError:
+                self.send_error(HTTPStatus.NOT_FOUND)
+                return
+            if not path.exists():
+                self.send_error(HTTPStatus.NOT_FOUND)
+                return
+            self.respond_file(path)
+            return
         self.send_error(HTTPStatus.NOT_FOUND)
 
     def do_POST(self) -> None:
@@ -1607,6 +1731,20 @@ class AppHandler(BaseHTTPRequestHandler):
         data = json.dumps(payload, ensure_ascii=False).encode("utf-8")
         self.send_response(status)
         self.send_header("Content-Type", "application/json; charset=utf-8")
+        self.send_header("Content-Length", str(len(data)))
+        self.end_headers()
+        self.wfile.write(data)
+
+    def respond_file(self, path: Path) -> None:
+        data = path.read_bytes()
+        suffix = path.suffix.lower()
+        content_type = {
+            ".html": "text/html; charset=utf-8",
+            ".csv": "text/csv; charset=utf-8",
+            ".json": "application/json; charset=utf-8",
+        }.get(suffix, "application/octet-stream")
+        self.send_response(HTTPStatus.OK)
+        self.send_header("Content-Type", content_type)
         self.send_header("Content-Length", str(len(data)))
         self.end_headers()
         self.wfile.write(data)
