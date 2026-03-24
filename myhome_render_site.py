@@ -44,8 +44,12 @@ DEFAULT_HOST = os.environ.get("MYHOME_HOST", "0.0.0.0")
 DEFAULT_PORT = env_int("PORT", env_int("MYHOME_PORT", 10000))
 DEFAULT_CITY_ID = env_int("MYHOME_CITY_ID", 1)
 DEFAULT_PER_PAGE = env_int("MYHOME_PER_PAGE", 100)
-DEFAULT_MAX_PAGES = env_int("MYHOME_MAX_PAGES", 12)
+DEFAULT_MAX_PAGES = env_int("MYHOME_MAX_PAGES", 30)
 MAX_RETURN_ITEMS = env_int("MYHOME_MAX_RETURN_ITEMS", 120)
+PROPERTY_MODES = {
+    "residential": {"label": "Квартиры", "real_estate_types": "1"},
+    "commercial": {"label": "Коммерческая", "real_estate_types": "5"},
+}
 
 DB_SCHEMA = """
 CREATE TABLE IF NOT EXISTS scope_seen (
@@ -516,6 +520,14 @@ HTML_PAGE = """<!DOCTYPE html>
         <h3>Фильтры</h3>
         <div class="stack">
           <div class="field">
+            <label>Тип недвижимости</label>
+            <select id="propertyModeSelect">
+              <option value="residential">Обычная (квартиры)</option>
+              <option value="commercial">Коммерческая</option>
+            </select>
+          </div>
+
+          <div class="field">
             <label>Район</label>
             <select id="districtSelect"></select>
           </div>
@@ -630,6 +642,10 @@ HTML_PAGE = """<!DOCTYPE html>
     function selectedDistrictId() {
       const value = $("districtSelect").value || "";
       return value ? Number(value) : null;
+    }
+
+    function selectedPropertyMode() {
+      return $("propertyModeSelect").value || "residential";
     }
 
     function selectedUrbanId() {
@@ -833,6 +849,7 @@ HTML_PAGE = """<!DOCTYPE html>
 
     function buildPayload() {
       return {
+        property_mode: selectedPropertyMode(),
         district_id: selectedDistrictId(),
         district_name: selectedDistrictName(),
         urban_id: selectedUrbanId(),
@@ -862,7 +879,11 @@ HTML_PAGE = """<!DOCTYPE html>
     }
 
     async function loadCatalog(refresh = false) {
-      const response = await fetch(refresh ? "/api/catalog?refresh=1" : "/api/catalog");
+      const params = new URLSearchParams();
+      if (refresh) params.set("refresh", "1");
+      params.set("property_mode", selectedPropertyMode());
+      const suffix = params.toString() ? `?${params.toString()}` : "";
+      const response = await fetch(`/api/catalog${suffix}`);
       const payload = await response.json();
       if (!response.ok) throw new Error(payload.error || "Не удалось загрузить каталог");
       state.catalog = payload;
@@ -1000,6 +1021,20 @@ HTML_PAGE = """<!DOCTYPE html>
       state.selectedStreetMatches = state.selectedStreetMatches.filter((item) => !districtId || item.district_id === districtId);
       renderSelectedStreets();
       renderStreetResults(state.lastStreetResults.filter((item) => !districtId || item.district_id === districtId));
+    });
+
+    $("propertyModeSelect").addEventListener("change", async () => {
+      state.selectedStreetMatches = [];
+      state.lastStreetResults = [];
+      $("streetResults").innerHTML = "";
+      renderSelectedStreets();
+      try {
+        setStatus("Каталог", "Переключаю режим недвижимости и обновляю каталог...", "", []);
+        await loadCatalog(false);
+        setStatus("Готов", "Режим недвижимости обновлён.", "", []);
+      } catch (error) {
+        setStatus("Ошибка", `<span class="status-warn">${esc(error.message || String(error))}</span>`);
+      }
     });
 
     $("urbanSelect").addEventListener("change", () => {
@@ -1164,12 +1199,21 @@ def text_list(values: Any) -> list[str]:
     return output
 
 
+def resolve_property_mode(value: Any) -> str:
+    mode = str(value or "residential").strip().lower()
+    if mode not in PROPERTY_MODES:
+        return "residential"
+    return mode
+
+
 def build_scope_label(payload: dict[str, Any], street_ids: list[int]) -> str:
     district_name = str(payload.get("district_name") or "").strip()
     urban_name = str(payload.get("urban_name") or "").strip()
     street_names = text_list(payload.get("street_names"))
+    property_mode = resolve_property_mode(payload.get("property_mode"))
+    property_label = PROPERTY_MODES[property_mode]["label"]
 
-    parts = ["Квартиры Тбилиси"]
+    parts = [f"{property_label} Тбилиси"]
     if district_name:
         parts.append(district_name)
     elif payload.get("district_id"):
@@ -1197,12 +1241,14 @@ def normalize_payload(payload: dict[str, Any]) -> dict[str, Any]:
     district_id = to_int(payload.get("district_id"))
     urban_id = to_int(payload.get("urban_id"))
     street_ids = int_list(payload.get("street_ids"))
+    property_mode = resolve_property_mode(payload.get("property_mode"))
 
     filters = {
         "city_id": DEFAULT_CITY_ID,
         "deal_types": "1,2",
-        "real_estate_types": "1",
+        "real_estate_types": PROPERTY_MODES[property_mode]["real_estate_types"],
         "statuses": "2",
+        "property_mode": property_mode,
         "district_id": district_id,
         "urban_id": urban_id,
         "street_ids": street_ids,
@@ -1211,6 +1257,8 @@ def normalize_payload(payload: dict[str, Any]) -> dict[str, Any]:
     return {
         "scope_key": hashlib.sha1(signature.encode("utf-8")).hexdigest()[:16],
         "scope_label": build_scope_label(payload, street_ids),
+        "property_mode": property_mode,
+        "property_label": PROPERTY_MODES[property_mode]["label"],
         "district_id": district_id,
         "district_name": str(payload.get("district_name") or "").strip() or None,
         "urban_id": urban_id,
@@ -1221,11 +1269,12 @@ def normalize_payload(payload: dict[str, Any]) -> dict[str, Any]:
     }
 
 
-def build_catalog_args(refresh: bool = False) -> argparse.Namespace:
+def build_catalog_args(property_mode: str = "residential", refresh: bool = False) -> argparse.Namespace:
+    resolved_mode = resolve_property_mode(property_mode)
     return argparse.Namespace(
         city_id=DEFAULT_CITY_ID,
         deal_types="1,2",
-        real_estate_types="1",
+        real_estate_types=PROPERTY_MODES[resolved_mode]["real_estate_types"],
         statuses="2",
         currency_id="1",
         catalog_cache=CATALOG_CACHE_PATH,
@@ -1233,8 +1282,13 @@ def build_catalog_args(refresh: bool = False) -> argparse.Namespace:
     )
 
 
-def load_catalog(refresh: bool = False) -> dict[str, Any]:
-    return export_mod.build_location_catalog(build_catalog_args(refresh=refresh), force_refresh=refresh)
+def load_catalog(property_mode: str = "residential", refresh: bool = False) -> dict[str, Any]:
+    payload = export_mod.build_location_catalog(
+        build_catalog_args(property_mode=property_mode, refresh=refresh),
+        force_refresh=refresh,
+    )
+    payload["property_mode"] = resolve_property_mode(property_mode)
+    return payload
 
 
 def search_streets(query: str, district_id: int | None, urban_id: int | None) -> list[dict[str, Any]]:
@@ -1445,7 +1499,7 @@ def fetch_scope_rows(scope: dict[str, Any], job_id: str) -> tuple[list[dict[str,
     args = SimpleNamespace(
         city_id=DEFAULT_CITY_ID,
         deal_types="1,2",
-        real_estate_types="1",
+        real_estate_types=scope["filters"]["real_estate_types"],
         statuses="2",
         currency_id="1",
     )
@@ -1634,8 +1688,9 @@ class AppHandler(BaseHTTPRequestHandler):
         if parsed.path == "/api/catalog":
             query = parse_qs(parsed.query)
             refresh = query.get("refresh", ["0"])[0] == "1"
+            property_mode = resolve_property_mode(query.get("property_mode", ["residential"])[0])
             try:
-                self.respond_json(load_catalog(refresh=refresh))
+                self.respond_json(load_catalog(property_mode=property_mode, refresh=refresh))
             except Exception as exc:  # noqa: BLE001
                 self.respond_json({"error": str(exc)}, status=HTTPStatus.INTERNAL_SERVER_ERROR)
             return

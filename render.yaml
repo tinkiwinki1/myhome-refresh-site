@@ -15,7 +15,7 @@ services:
       - key: MYHOME_PER_PAGE
         value: 100
       - key: MYHOME_MAX_PAGES
-        value: 12
+        value: 30
       - key: MYHOME_MAX_RETURN_ITEMS
         value: 120
     disk:
