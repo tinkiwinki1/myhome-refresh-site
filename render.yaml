@@ -1,0 +1,24 @@
+services:
+  - type: web
+    name: myhome-refresh-site
+    runtime: python
+    region: frankfurt
+    plan: starter
+    buildCommand: pip install -r requirements.txt
+    startCommand: python3 myhome_render_site.py
+    healthCheckPath: /healthz
+    envVars:
+      - key: PYTHON_VERSION
+        value: 3.11.8
+      - key: MYHOME_DATA_DIR
+        value: /var/data
+      - key: MYHOME_PER_PAGE
+        value: 100
+      - key: MYHOME_MAX_PAGES
+        value: 12
+      - key: MYHOME_MAX_RETURN_ITEMS
+        value: 120
+    disk:
+      name: myhome-data
+      mountPath: /var/data
+      sizeGB: 10

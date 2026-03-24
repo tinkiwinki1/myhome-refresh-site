@@ -1,0 +1,10 @@
+__pycache__/
+*.pyc
+.venv/
+state/
+exports/
+render_data/
+.DS_Store
+habitica-local/
+habitica-local.bak.1771981045/
+Трекер привычек/
